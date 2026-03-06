@@ -33,6 +33,12 @@ int gI_ColorWhite[4] = {255, 255, 255, 255};
 float gF_PointPos[MAXPLAYERS + 1][NUM_POINTS][3];
 float gF_Gravity;
 
+bool gB_HasResult[MAXPLAYERS + 1];
+bool gB_Impossible[MAXPLAYERS + 1];
+float gF_ResultDiff[MAXPLAYERS + 1][3];
+float gF_ResultMinVel[MAXPLAYERS + 1];
+float gF_ResultMinVelOneTick[MAXPLAYERS + 1];
+
 /* CVARs */
 ConVar gCV_BeamMaterial;
 
@@ -40,9 +46,9 @@ ConVar gCV_BeamMaterial;
 public Plugin myinfo =
 {
 	name = "Gap",
-	author = "ici, velocity calculation by Saul and implemented by Charles_(hypnos)",
+	author = "ici, velocity calculation by Saul and implemented by Charles_(hypnos), some improvements by EpsilonBSP",
 	description = "",
-	version = "1.1",
+	version = "1.2",
 	url = ""
 }
 
@@ -74,7 +80,9 @@ public void OnPluginStart()
 	sv_gravity.AddChangeHook(OnGravityChanged);
 	gF_Gravity = sv_gravity.FloatValue;
 
-	if ((gEV_Type != Engine_CSS) || (gEV_Type != Engine_CSGO))
+	gEV_Type = GetEngineVersion();
+
+	if ((gEV_Type != Engine_CSS) && (gEV_Type != Engine_CSGO))
 	{
 		SetFailState("Game not supported.");
 	}
@@ -114,6 +122,17 @@ public Action CommandGap(int client, int args)
 		return Plugin_Handled;
 	}
 
+	gI_CurrPoint[client] = POINT_A;
+	gF_PointPos[client][POINT_A] = NULL_VECTOR;
+	gF_PointPos[client][POINT_B] = NULL_VECTOR;
+	gB_HasResult[client] = false;
+
+	if (gH_PreviewTimer[client] != null)
+	{
+		KillTimer(gH_PreviewTimer[client]);
+		gH_PreviewTimer[client] = null;
+	}
+
 	OpenMenu(client);
 	return Plugin_Handled;
 }
@@ -122,38 +141,74 @@ void OpenMenu(int client)
 {
 	Panel panel = new Panel();
 
-	panel.SetTitle("Gap");
-	panel.DrawItem("Select point");
-
-	// Feeling kinda lazy today
-	if (gB_ShowCursor[client])
-	{
-		panel.DrawItem("Show cursor: on");
-	}
-	else
-	{
-		panel.DrawItem("Show cursor: off");
-	}
-
+	char gridText[32];
 	if (gI_SnapToGrid[client] == 0)
-	{
-		panel.DrawItem("Snap to grid: off");
-	}
+		FormatEx(gridText, sizeof(gridText), "off");
 	else
+		FormatEx(gridText, sizeof(gridText), "%d", gI_SnapValues[gI_SnapToGrid[client]]);
+
+	char decreaseText[32], increaseText[32];
+	FormatEx(decreaseText, sizeof(decreaseText), "Decrease grid [%s]", gridText);
+	FormatEx(increaseText, sizeof(increaseText), "Increase grid [%s]", gridText);
+
+	panel.SetTitle("Gap");
+	panel.DrawItem("Select point A");
+	panel.DrawItem("Select point B");
+	panel.DrawItem("Clear points");
+	panel.DrawItem(decreaseText);
+	panel.DrawItem(increaseText);
+	panel.DrawItem(gB_ShowCursor[client] ? "Show cursor: on" : "Show cursor: off");
+
+	char coordLine[64];
+	if (gI_CurrPoint[client] == POINT_B || gB_HasResult[client])
 	{
-		char gridText[32];
-		FormatEx(gridText, sizeof(gridText), "Snap to grid: %d", gI_SnapValues[ gI_SnapToGrid[client] ] );
-		panel.DrawItem(gridText);
+		panel.DrawText("---");
+		FormatEx(coordLine, sizeof(coordLine), "A: %.2f, %.2f, %.2f",
+			gF_PointPos[client][POINT_A][0],
+			gF_PointPos[client][POINT_A][1],
+			gF_PointPos[client][POINT_A][2]);
+		panel.DrawText(coordLine);
+	}
+	if (gB_HasResult[client])
+	{
+		FormatEx(coordLine, sizeof(coordLine), "B: %.2f, %.2f, %.2f",
+			gF_PointPos[client][POINT_B][0],
+			gF_PointPos[client][POINT_B][1],
+			gF_PointPos[client][POINT_B][2]);
+		panel.DrawText(coordLine);
+	}
+
+	if (gB_HasResult[client])
+	{
+		char line[64];
+		float dx = FloatAbs(gF_ResultDiff[client][0]);
+		float dy = FloatAbs(gF_ResultDiff[client][1]);
+		float dz = FloatAbs(gF_ResultDiff[client][2]);
+
+		panel.DrawText("---");
+		FormatEx(line, sizeof(line), "X: %.2f  Y: %.2f  Z: %.2f", dx, dy, dz);
+		panel.DrawText(line);
+		FormatEx(line, sizeof(line), "XY: %.2f  XZ: %.2f  YZ: %.2f",
+			SquareRoot(dx*dx + dy*dy),
+			SquareRoot(dx*dx + dz*dz),
+			SquareRoot(dy*dy + dz*dz));
+		panel.DrawText(line);
+		FormatEx(line, sizeof(line), "XYZ: %.2f", SquareRoot(dx*dx + dy*dy + dz*dz));
+		panel.DrawText(line);
+		if (gB_Impossible[client])
+			panel.DrawText("MinVel: Impossible (dZ>65)");
+		else
+		{
+			FormatEx(line, sizeof(line), "MinVel: %.2f  (+1t: %.2f)",
+				gF_ResultMinVel[client], gF_ResultMinVelOneTick[client]);
+			panel.DrawText(line);
+		}
 	}
 
 	if (gEV_Type == Engine_CSS)
-	{
 		panel.CurrentKey = 10;
-	}
 	else
-	{
 		panel.CurrentKey = 9;
-	}
 	panel.DrawItem("Exit", ITEMDRAW_CONTROL);
 
 	gB_Gap[client] = panel.Send(client, handler, MENU_TIME_FOREVER);
@@ -216,6 +271,7 @@ public int handler(Menu menu, MenuAction action, int client, int item)
 	if (action != MenuAction_Select)
 	{
 		gB_Gap[client] = false;
+		gB_HasResult[client] = false;
 
 		if (gH_PreviewTimer[client] != null)
 		{
@@ -234,87 +290,18 @@ public int handler(Menu menu, MenuAction action, int client, int item)
 
 	switch (item)
 	{
-		case 1: // Select point
+		case 1: // Select point A
 		{
-			if (GetAimPosition(client, gF_PointPos[ client ][ gI_CurrPoint[client] ]))
+			if (GetAimPosition(client, gF_PointPos[client][POINT_A]))
 			{
-				if (gI_CurrPoint[client] == POINT_A && gH_PreviewTimer[client] != null)
+				if (gH_PreviewTimer[client] != null)
 				{
-					// Don't retrigger the timer
 					KillTimer(gH_PreviewTimer[client]);
 					gH_PreviewTimer[client] = null;
 				}
-
-				gI_CurrPoint[client]++;
-
-				if (gI_CurrPoint[client] == NUM_POINTS)
-				{
-					float startPos[3], endPos[3];
-
-					startPos = gF_PointPos[client][ POINT_A ];
-					endPos   = gF_PointPos[client][ POINT_B ];
-
-					// Draw a line between the two points
-					DrawRing(client, startPos, RING_START_RADIUS, RING_END_RADIUS, PREVIEW_TIME, gI_ColorGreen, FBEAM_FADEIN);
-					DrawRing(client, endPos, RING_START_RADIUS, RING_END_RADIUS, PREVIEW_TIME, gI_ColorRed, FBEAM_FADEIN);
-					DrawLine(client, startPos, endPos, 1.0, PREVIEW_TIME, gI_ColorWhite);
-					gH_PreviewTimer[client] = CreateTimer(PREVIEW_TIME, CompleteGap, GetClientUserId(client), .flags = TIMER_REPEAT|TIMER_FLAG_NO_MAPCHANGE);
-
-					float distance = GetDistance(startPos, endPos);
-					float difference[3];
-					SubtractVectors(endPos, startPos, difference);
-
-					if(difference[2] > 65)
-					{
-						Print2(client, "{CHAT}Distance: {YELLOWORANGE}%.2f {CHAT}DiifX: {YELLOWORANGE}%.2f {CHAT}DiffY: {YELLOWORANGE}%.2f {CHAT}DiffZ: {YELLOWORANGE}%.2f {CHAT}MinVelocity: {YELLOWORANGE}Impossible Jump ΔZ>65",
-							distance,
-							difference[0], difference[1], difference[2]);
-					}
-					else
-					{
-						// Credit to Saul for velocity calculations
-						float gFallTime, gFallHeight, gFallVelocity;
-
-						if (difference[2] > 64)
-						{
-							gFallHeight = 65 - difference[2]; // z distance from top of jump to selected point, assuming sv_gravity 800 is used.
-						}
-						else
-						{
-							gFallHeight = 64 - difference[2];
-						}
-
-						float m_flGravity = GetEntityGravity(client);
-
-						float g_flGravityTick = SquareRoot(2 * 800 * 57.0) - (gF_Gravity  * m_flGravity * 1.5 * GetTickInterval());
-						gFallVelocity = -1 * SquareRoot(2 * gF_Gravity * m_flGravity * gFallHeight); // z velocity player should have right before hitting the ground
-						gFallTime = -1 * (gFallVelocity - g_flGravityTick) / gF_Gravity * m_flGravity; // The amount of time the jump should have taken
-
-						float gInitialVel[3];
-
-						gInitialVel[0] = (endPos[0] - startPos[0]) / gFallTime; // Minimum velocity needed in x and y directions
-						gInitialVel[1] = (endPos[1] - startPos[1]) / gFallTime; // to reach the destination
-
-						float gMinVel = SquareRoot(Pow(gInitialVel[0], 2.0) + Pow(gInitialVel[1], 2.0));
-						float gInitialTick = Pow((gMinVel - 16.97) / 30.02, 1 / 0.5029);
-						float gFallTimeTicks = gFallTime * (1/GetTickInterval()); // carnifex' fault if it bugs
-						float gVelGain = (30.02 * Pow(gInitialTick + gFallTimeTicks, 0.5029) + 16.97) - (30.02 * Pow(gInitialTick, 0.5029) + 16.97);
-						float gMinVelOneTick = gMinVel - gVelGain;
-
-						if(gMinVelOneTick < 0 || gMinVel < 16.97)
-						{
-							gMinVelOneTick = 0.0;
-						}
-
-
-						// Credit to Charles_(hypnos) for the implementation of velocity stuff (https://hyps.dev/)
-						Print2(client, "{CHAT}Distance: {YELLOWORANGE}%.2f {CHAT}DiifX: {YELLOWORANGE}%.2f {CHAT}DiffY: {YELLOWORANGE}%.2f {CHAT}DiffZ: {YELLOWORANGE}%.2f {CHAT}MinVelocity: {YELLOWORANGE}%.2f {CHAT}MinVelocityWith1Tick: {YELLOWORANGE}%.2f",
-							distance,
-							difference[0], difference[1], difference[2], gMinVel, gMinVelOneTick);
-					}
-
-					gI_CurrPoint[client] = POINT_A;
-				}
+				gF_PointPos[client][POINT_B] = NULL_VECTOR;
+				gB_HasResult[client] = false;
+				gI_CurrPoint[client] = POINT_B;
 			}
 			else
 			{
@@ -322,21 +309,123 @@ public int handler(Menu menu, MenuAction action, int client, int item)
 			}
 			OpenMenu(client);
 		}
-		case 2: // Show cursor
+		case 2: // Select point B
 		{
-			gB_ShowCursor[client] = !gB_ShowCursor[client];
+			if (gI_CurrPoint[client] != POINT_B)
+			{
+				Print2(client, "{CHAT}Select point A first.");
+				OpenMenu(client);
+			}
+			else if (GetAimPosition(client, gF_PointPos[client][POINT_B]))
+			// Select point B, always recalculate
+			{
+				float startPos[3], endPos[3];
+
+				startPos = gF_PointPos[client][POINT_A];
+				endPos   = gF_PointPos[client][POINT_B];
+
+				// Draw a line between the two points
+				if (gH_PreviewTimer[client] != null)
+				{
+					KillTimer(gH_PreviewTimer[client]);
+					gH_PreviewTimer[client] = null;
+				}
+				DrawRing(client, startPos, RING_START_RADIUS, RING_END_RADIUS, PREVIEW_TIME, gI_ColorGreen, FBEAM_FADEIN);
+				DrawRing(client, endPos, RING_START_RADIUS, RING_END_RADIUS, PREVIEW_TIME, gI_ColorRed, FBEAM_FADEIN);
+				DrawLine(client, startPos, endPos, 1.0, PREVIEW_TIME, gI_ColorWhite);
+				gH_PreviewTimer[client] = CreateTimer(PREVIEW_TIME, CompleteGap, GetClientUserId(client), .flags = TIMER_REPEAT|TIMER_FLAG_NO_MAPCHANGE);
+
+				float difference[3];
+				SubtractVectors(endPos, startPos, difference);
+
+				gB_HasResult[client] = true;
+				gF_ResultDiff[client] = difference;
+
+				if(difference[2] > 65)
+				{
+					gB_Impossible[client] = true;
+				}
+				else
+				{
+					gB_Impossible[client] = false;
+					// Credit to Saul for velocity calculations
+					float gFallTime, gFallHeight, gFallVelocity;
+
+					if (difference[2] > 64)
+					{
+						gFallHeight = 65 - difference[2]; // z distance from top of jump to selected point, assuming sv_gravity 800 is used.
+					}
+					else
+					{
+						gFallHeight = 64 - difference[2];
+					}
+
+					float m_flGravity = GetEntityGravity(client);
+
+					float g_flGravityTick = SquareRoot(2 * 800 * 57.0) - (gF_Gravity  * m_flGravity * 1.5 * GetTickInterval());
+					gFallVelocity = -1 * SquareRoot(2 * gF_Gravity * m_flGravity * gFallHeight); // z velocity player should have right before hitting the ground
+					gFallTime = -1 * (gFallVelocity - g_flGravityTick) / gF_Gravity * m_flGravity; // The amount of time the jump should have taken
+
+					float gInitialVel[3];
+
+					gInitialVel[0] = (endPos[0] - startPos[0]) / gFallTime; // Minimum velocity needed in x and y directions
+					gInitialVel[1] = (endPos[1] - startPos[1]) / gFallTime; // to reach the destination
+
+					float gMinVel = SquareRoot(Pow(gInitialVel[0], 2.0) + Pow(gInitialVel[1], 2.0));
+					float gInitialTick = Pow((gMinVel - 16.97) / 30.02, 1 / 0.5029);
+					float gFallTimeTicks = gFallTime * (1/GetTickInterval()); // carnifex' fault if it bugs
+					float gVelGain = (30.02 * Pow(gInitialTick + gFallTimeTicks, 0.5029) + 16.97) - (30.02 * Pow(gInitialTick, 0.5029) + 16.97);
+					float gMinVelOneTick = gMinVel - gVelGain;
+
+					if(gMinVelOneTick < 0 || gMinVel < 16.97)
+					{
+						gMinVelOneTick = 0.0;
+					}
+
+					gF_ResultMinVel[client] = gMinVel;
+					gF_ResultMinVelOneTick[client] = gMinVelOneTick;
+				}
+
+				OpenMenu(client);
+			}
+			else
+			{
+				Print2(client, "{CHAT}Couldn't get point position (raytrace did not hit). Try again.");
+				OpenMenu(client);
+			}
+		}
+		case 3: // Clear points
+		{
+			gI_CurrPoint[client] = POINT_A;
+			gF_PointPos[client][POINT_A] = NULL_VECTOR;
+			gF_PointPos[client][POINT_B] = NULL_VECTOR;
+			gB_HasResult[client] = false;
+			if (gH_PreviewTimer[client] != null)
+			{
+				KillTimer(gH_PreviewTimer[client]);
+				gH_PreviewTimer[client] = null;
+			}
 			OpenMenu(client);
 		}
-		case 3: // Snap to grid
+		case 4: // Decrease grid
 		{
-			gI_SnapToGrid[client]++;
-			gI_SnapToGrid[client] = gI_SnapToGrid[client] % sizeof(gI_SnapValues);
-
+			gI_SnapToGrid[client] = (gI_SnapToGrid[client] - 1 + sizeof(gI_SnapValues)) % sizeof(gI_SnapValues);
+			OpenMenu(client);
+		}
+		case 5: // Increase grid
+		{
+			gI_SnapToGrid[client] = (gI_SnapToGrid[client] + 1) % sizeof(gI_SnapValues);
+			OpenMenu(client);
+		}
+		case 6: // Show cursor
+		{
+			gB_ShowCursor[client] = !gB_ShowCursor[client];
 			OpenMenu(client);
 		}
 		case 9, 10:
 		{
 			gB_Gap[client] = false;
+			gB_HasResult[client] = false;
 
 			if (gH_PreviewTimer[client] != null)
 			{
@@ -487,6 +576,7 @@ void ResetVariables(int client)
 
 	gI_SnapToGrid[client] = 0; // off
 	gB_ShowCursor[client] = true;
+	gB_HasResult[client] = false;
 
 	if (gH_PreviewTimer[client] != null)
 	{
@@ -499,13 +589,6 @@ void ResetVariables(int client)
 		KillTimer(gH_CursorTimer[client]);
 		gH_CursorTimer[client] = null;
 	}
-}
-
-float GetDistance(float startPos[3], float endPos[3])
-{
-	float difference[3];
-	SubtractVectors(endPos, startPos, difference);
-	return GetVectorLength(difference);
 }
 
 stock float[] SnapToGrid(float pos[3], int grid, bool third)
